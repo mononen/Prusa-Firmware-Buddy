@@ -7,6 +7,7 @@
 #include "Marlin/src/module/temperature.h"
 #include "fanctl.hpp"
 #include <module/tool_change.h>
+#include <mapi/parking.hpp>
 #include <algorithm>
 #include <cmath>
 
