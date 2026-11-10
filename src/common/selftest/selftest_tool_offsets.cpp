@@ -1,15 +1,12 @@
 #include "selftest_tool_offsets.hpp"
 #include "Marlin/src/gcode/queue.h"
 #include "Marlin/src/module/stepper.h"
+#include "Marlin/src/module/motion.h"
 #include "marlin_server.hpp"
 #include "selftest_tool_helper.hpp"
 #include "Marlin/src/module/temperature.h"
 #include "fanctl.hpp"
 
-#include <option/has_tool_offset_pin_calibration.h>
-#if HAS_TOOL_OFFSET_PIN_CALIBRATION()
-    #include <marlin_stubs/G425.hpp>
-#endif
 #include <tool_index.hpp>
 
 using namespace selftest;
@@ -144,14 +141,9 @@ LoopResult CSelftestPart_ToolOffsets::state_calibrate() {
     return LoopResult::RunNext;
 }
 
-/**
- * This state exists just because full_calibration() is a blocking call and we need to update FSM state
- * to let the user know that calibration is in progress.
- * The issue is that the fsm takes update after returning from a state function, so we cannot do it in one state.
- */
+// The FSM must publish the calibration phase before the blocking measurement.
 LoopResult CSelftestPart_ToolOffsets::state_finish_calibration() {
-    bool calibration_success = full_calibration();
-    if (!calibration_success) {
+    if (axis_unhomed_error() || !pin_calibration.measure_remaining_tools()) {
         return LoopResult::Fail;
     }
     return LoopResult::RunNext;

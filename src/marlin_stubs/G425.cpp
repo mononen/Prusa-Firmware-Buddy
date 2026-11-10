@@ -151,7 +151,6 @@ constexpr MachinePosXYZ true_top_center = { { { .x = true_center.x,
     .y = true_center.y,
     .z = dimensions.z } } };
 
-constexpr float PROBE_Z_BORE_MM { 1 };
 constexpr auto PROBE_Z_UNCERTAIN_DIST_MM { 5 };
 constexpr auto PROBE_Z_CERTAIN_DIST_MM { 1 };
 constexpr float PIN_DIAMETER_MM { 6 };
@@ -168,6 +167,12 @@ constexpr auto XY_ACCELERATION_MMSS { 500 };
 constexpr auto RESONANCE_DAMPER_WAIT_MS { 500 };
 constexpr auto MIN_TRAVELED_DISTANCE_MM { 0.1f };
 constexpr auto MAX_DEVIATION_MM { 0.2f };
+
+struct CenterFailure {
+    pin_calibration::NozzleFailureReason reason;
+    float approach_angle_rad;
+    float deviation_mm;
+};
 
 struct measurements_t {
     MachinePosXYZ obj_center = true_top_center; // Non-static must be assigned from MachinePosXYZ
@@ -270,16 +275,16 @@ void go_to_safety_circle(const MachinePosXY &center, const float radius) {
     planner.synchronize();
 }
 
-MachinePosXYZ initial_position(const MachinePosXYZ &center, const float angle, const float radius) {
+MachinePosXYZ initial_position(const MachinePosXYZ &center, const float angle, const float radius, const float bore_depth_mm) {
     return {
         .x = center.x + cos(angle) * radius,
         .y = center.y + sin(angle) * radius,
-        .z = center.z - PROBE_Z_BORE_MM,
+        .z = center.z - bore_depth_mm,
     };
 }
 
-void go_to_initial(const MachinePosXYZ &center, const float angle, const float radius) {
-    const MachinePosXYZE initial = current_machine_position().with_xyz(initial_position(center, angle, radius));
+void go_to_initial(const MachinePosXYZ &center, const float angle, const float radius, const float bore_depth_mm) {
+    const MachinePosXYZE initial = current_machine_position().with_xyz(initial_position(center, angle, radius, bore_depth_mm));
 
     const MachinePosXY current = current_machine_position().xy();
 
@@ -376,14 +381,14 @@ MachinePosXY probe_xy(const MachinePosXYZ &center, const float angle, const uint
     return hit_mm.xy();
 }
 
-MachinePosXY synthetic_probe(const MachinePosXYZ &center, const float angle) {
-    return { { { .x = center.x + (PIN_DIAMETER_MM / 2 + PROBE_Z_BORE_MM) * cos(angle),
-        .y = center.y + (PIN_DIAMETER_MM / 2 + PROBE_Z_BORE_MM) * sin(angle) } } };
+MachinePosXY synthetic_probe(const MachinePosXYZ &center, const float angle, const float bore_depth_mm) {
+    return { { { .x = center.x + (PIN_DIAMETER_MM / 2 + bore_depth_mm) * cos(angle),
+        .y = center.y + (PIN_DIAMETER_MM / 2 + bore_depth_mm) * sin(angle) } } };
 }
 
-MachinePosXY probe_xy_verify(const MachinePosXYZ &center, const float angle, const float probe_distance, const uint8_t tool, const Phase phase) {
+std::expected<MachinePosXY, CenterFailure> probe_xy_verify(const MachinePosXYZ &center, const float angle, const float probe_distance, const float bore_depth_mm, const uint8_t tool, const Phase phase) {
     go_to_safety_circle(center.xy(), probe_distance);
-    go_to_initial(center, angle, probe_distance);
+    go_to_initial(center, angle, probe_distance, bore_depth_mm);
 
     // Take all samples
     std::array<MachinePosXY, NUM_PROBE_SAMPLES> hits;
@@ -428,7 +433,7 @@ MachinePosXY probe_xy_verify(const MachinePosXYZ &center, const float angle, con
             static_cast<double>(pos.x),
             static_cast<double>(pos.y));
 
-        const float exp_dist = (pos - synthetic_probe(center, angle)).magnitude();
+        const float exp_dist = (pos - synthetic_probe(center, angle, bore_depth_mm)).magnitude();
         if (exp_dist > PROBE_FAIL_THRESHOLD_MM) {
             fatal_error(ErrCode::ERR_MECHANICAL_XY_POSITION_INVALID, static_cast<double>(exp_dist), static_cast<double>(PROBE_FAIL_THRESHOLD_MM));
         }
@@ -436,9 +441,7 @@ MachinePosXY probe_xy_verify(const MachinePosXYZ &center, const float angle, con
         return pos;
     }
 
-    fatal_error(ErrCode::ERR_MECHANICAL_XY_PROBE_UNSTABLE);
-
-    return hits[0];
+    return std::unexpected(CenterFailure { .reason = pin_calibration::NozzleFailureReason::xy_probe_unstable, .approach_angle_rad = angle, .deviation_mm = 0 });
 }
 
 /// Probe in Z, first in the middle then it does circle around center of the pin, just to distribute the probes over larger area to minimize errors
@@ -508,30 +511,31 @@ float probe_z(const MachinePosXYZ &position, float uncertainty, const int num_me
     return measurement_avg;
 }
 
-/// Issue a warning if a point deviates too much from the circle
-bool check_deviation(const MachinePosXY &center, std::span<const MachinePosXY> points) {
-    // Compute average radius
+/// Return the touch farthest outside the average radius if it exceeds the limit.
+std::optional<CenterFailure> find_roundness_outlier(const MachinePosXY &center, std::span<const MachinePosXY> points, std::span<const float> angles_rad) {
     float radius = 0;
     for (const MachinePosXY &p : points) {
         radius += (center - p).magnitude();
     }
     radius /= points.size();
 
-    // Compute maximum deviation of point-center distance from average radius
     float max_dev = 0;
-    for (const MachinePosXY &p : points) {
-        max_dev = max(max_dev, (center - p).magnitude() - radius);
+    size_t max_index = 0;
+    for (size_t i = 0; i < points.size(); ++i) {
+        const float deviation = (center - points[i]).magnitude() - radius;
+        if (deviation > max_dev) {
+            max_dev = deviation;
+            max_index = i;
+        }
     }
-
-    // Issue warning if maximum deviation is above threshold
     if (max_dev > MAX_DEVIATION_MM) {
-        return false;
+        return CenterFailure { pin_calibration::NozzleFailureReason::not_round, angles_rad[max_index], max_dev };
     }
     metric_record_float(&metric_xy_dev, max_dev);
-    return true;
+    return std::nullopt;
 }
 
-const std::optional<MachinePosXYZ> get_single_xyz_center(const MachinePosXYZ &initial, const uint8_t tool, const Phase phase) {
+std::expected<MachinePosXYZ, CenterFailure> get_single_xyz_center(const MachinePosXYZ &initial, const float bore_depth_mm, const uint8_t tool, const Phase phase) {
     static constexpr uint8_t PHASE_XY_HITS[std::to_underlying(Phase::_count)] = { 3, 3, 12 };
     static constexpr uint8_t PHASE_Z_HITS[std::to_underlying(Phase::_count)] = { 1, 0, NUM_Z_MEASUREMENTS };
     static constexpr float PHASE_Z_UNCERTAINTY[std::to_underlying(Phase::_count)] = { PROBE_XY_UNCERTAIN_DIST_MM, PROBE_Z_UNCERTAIN_DIST_MM, PROBE_Z_CERTAIN_DIST_MM };
@@ -547,31 +551,37 @@ const std::optional<MachinePosXYZ> get_single_xyz_center(const MachinePosXYZ &in
     static constexpr uint8_t MAX_HITS = *std::max_element(std::begin(PHASE_XY_HITS), std::end(PHASE_XY_HITS));
     std::array<MachinePosXY, MAX_HITS> max_hits;
     std::span<MachinePosXY> hits(max_hits.begin(), PHASE_XY_HITS[std::to_underlying(phase)]);
-    for (uint hit_no = 0; MachinePosXY & hit : hits) {
-        hit = probe_xy_verify(start, 2 * std::numbers::pi_v<float> / hits.size() * hit_no++, PROBE_XY_UNCERTAIN_DIST_MM, tool, phase);
+    std::array<float, MAX_HITS> angles {};
+    for (uint hit_no = 0; hit_no < hits.size(); ++hit_no) {
+        angles[hit_no] = 2 * std::numbers::pi_v<float> / hits.size() * hit_no;
+        auto hit = probe_xy_verify(start, angles[hit_no], PROBE_XY_UNCERTAIN_DIST_MM, bore_depth_mm, tool, phase);
+        if (!hit) {
+            return std::unexpected(hit.error());
+        }
+        hits[hit_no] = *hit;
     }
     const MachinePosXYZ center = MachinePosXYZ(approximate_center(hits)).with_z(start.z);
 
     if (phase == Phase::final) {
-        if (!check_deviation(center.xy(), hits)) {
-            return std::nullopt;
+        if (auto failure = find_roundness_outlier(center.xy(), hits, std::span<const float>(angles.data(), hits.size()))) {
+            return std::unexpected(*failure);
         }
     }
 
     return center;
 }
 
-const std::optional<MachinePosXYZ> get_xyz_center(const uint8_t tool) {
-
-    // Enable loadcell high precision across the entire procedure to prime the noise filters
+std::expected<MachinePosXYZ, CenterFailure> get_xyz_center(const uint8_t tool, const float bore_depth_mm) {
     auto loadcellPrecisionEnabler = Loadcell::HighPrecisionEnabler(loadcell);
 
-    std::optional<MachinePosXYZ> center = true_top_center;
+    MachinePosXYZ center = true_top_center;
     for (Phase phase = Phase::first; phase != Phase::_count; phase = Phase(std::to_underlying(phase) + 1)) {
-        if (!center.has_value()) {
-            return std::nullopt;
+        auto measured = get_single_xyz_center(center, bore_depth_mm, tool, phase);
+        if (!measured) {
+            go_to_safe_height();
+            return std::unexpected(measured.error());
         }
-        center = get_single_xyz_center(center.value(), tool, phase);
+        center = *measured;
     }
 
     go_to_safe_height();
@@ -618,7 +628,7 @@ inline bool calibrate_toolhead(measurements_t &m, const uint8_t extruder) {
     UNUSED(extruder);
 #endif
 
-    const std::optional<MachinePosXYZ> center = get_xyz_center(extruder);
+    const auto center = get_xyz_center(extruder, pin_calibration::DEFAULT_BORE_DEPTH_MM);
     if (!center.has_value()) {
         // TODO:
         SERIAL_ECHOLNPAIR("G425: Tool ", extruder, " center not found.");
@@ -702,15 +712,26 @@ inline void calibrate_all() {
     tool_change(NoTool {}, tool_return_t::no_return);
 }
 
-/**
- * Perform a full auto-calibration routine - simple implementation:
- *
- * This is simplified version that:
- * - un-applies, zeroes all offsets
- * - measures pin centers for all the pins
- * - computes new offsets
- */
-inline bool calibrate_all_simple() {
+} // anonymous namespace
+
+float pin_calibration::PinCalibration::bore_depth_mm(PhysicalToolIndex tool) const {
+    return shallow_tools[tool.to_raw()] ? SHALLOW_BORE_DEPTH_MM : DEFAULT_BORE_DEPTH_MM;
+}
+
+void pin_calibration::PinCalibration::use_shallow_bore_depth(PhysicalToolIndex tool) {
+    shallow_tools.set(tool.to_raw());
+}
+
+pin_calibration::PinCalibration::~PinCalibration() {
+    if (offsets_zeroed && !completed) {
+        prusa_toolchanger.load_tool_offsets();
+    }
+}
+
+std::expected<void, pin_calibration::NozzleFailure> pin_calibration::PinCalibration::measure_remaining_tools() {
+    TEMPORARY_SOFT_ENDSTOP_STATE(false);
+    TEMPORARY_BED_LEVELING_STATE(false);
+    phase_stepping::EnsureDisabled ps_disabler {};
     // Disable E steppers to reduce noise on loadcell
     disable_e_steppers();
 
@@ -726,36 +747,41 @@ inline bool calibrate_all_simple() {
     // Disable PA to reduce filter delay during probe analysis
     pressure_advance::PressureAdvanceDisabler pa_disabler;
 
-    // Zero hotend offsets
-    reset_hotend_offsets();
-    hotend_currently_applied_offset = xyz_pos_t {};
+    if (!offsets_zeroed) {
+        reset_hotend_offsets();
+        hotend_currently_applied_offset = xyz_pos_t {};
+        offsets_zeroed = true;
+    }
 
-    bool failed = false;
-    // Measure centers
-    StrongIndexArray<MachinePosXYZ, PhysicalToolIndex::count, PhysicalToolIndex, PhysicalToolIndex::to_raw_static> centers;
     for (auto tool : PhysicalToolIndex::all().skip_all_disabled()) {
-        tool_change(tool, tool_return_t::no_return);
-        std::optional<MachinePosXYZ> center = get_xyz_center(tool.to_raw());
-        if (!center.has_value()) {
-            SERIAL_ECHOLNPAIR("G425: Tool ", tool.to_raw(), " center not found.");
-            failed = true;
-            break; // Do not continue with the next tool
+        if (centers[tool]) {
+            continue;
         }
-        centers[tool] = center.value();
+        tool_change(tool, tool_return_t::no_return);
+        const float depth = bore_depth_mm(tool);
+        SERIAL_ECHOLNPAIR("G425: Tool ", tool.to_raw(), " XY probing ", depth, " mm below the pin top");
+        const auto center = get_xyz_center(tool.to_raw(), depth);
+        if (!center) {
+            const auto &error = center.error();
+            const float side_deg = std::fmod(error.approach_angle_rad * 180.f / std::numbers::pi_v<float> + 180.f, 360.f);
+            const auto side = static_cast<uint8_t>(static_cast<int>(std::lround(side_deg / 30.f)) % 12);
+            if (error.reason == NozzleFailureReason::not_round) {
+                SERIAL_ECHOLNPAIR("G425: Tool ", tool.to_raw(), " nozzle not round, side ", side * 30, " deg, deviation ", error.deviation_mm);
+            } else {
+                SERIAL_ECHOLNPAIR("G425: Tool ", tool.to_raw(), " XY probe unstable, side ", side * 30, " deg");
+            }
+            return std::unexpected(NozzleFailure { tool, error.reason, side, error.deviation_mm, depth });
+        }
+        centers[tool] = *center;
         metric_record_custom(
             &metric_center,
             ",t=%u x=%.3f,y=%.3f,z=%.3f",
             tool.to_raw(),
-            static_cast<double>(centers[tool].x),
-            static_cast<double>(centers[tool].y),
-            static_cast<double>(centers[tool].z));
+            static_cast<double>(center->x),
+            static_cast<double>(center->y),
+            static_cast<double>(center->z));
     }
 
-    if (failed) {
-        mapi::park(mapi::get_parking_position(mapi::ParkPosition::filament_change));
-        marlin_server::set_warning(WarningType::NozzleDoesNotHaveRoundSection);
-        return false;
-    }
 
     // Pick zero offset tool to be sure no offset is applied on toolchange
     tool_change(NoTool {}, tool_return_t::no_return);
@@ -768,7 +794,7 @@ inline bool calibrate_all_simple() {
         // One might ask why the "-" in front of the centers[e].
         // Remember, when tool is bend +x it will find the object at the position -x.
         // hotend_offset is tag-ambiguous, so it needs a bit of a whack to fit
-        hotend_offset[tool] = -centers[tool].to_tag<NativePosTag>();
+        hotend_offset[tool] = -centers[tool]->to_tag<NativePosTag>();
     }
     normalize_hotend_offsets();
 
@@ -801,22 +827,8 @@ inline bool calibrate_all_simple() {
             static_cast<double>(hotend_offset[tool].y),
             static_cast<double>(hotend_offset[tool].z));
     }
-    return true;
-}
-
-} // anonymous namespace
-
-bool full_calibration() {
-    TEMPORARY_SOFT_ENDSTOP_STATE(false);
-    TEMPORARY_BED_LEVELING_STATE(false);
-
-    phase_stepping::EnsureDisabled ps_disabler {};
-
-    if (axis_unhomed_error()) {
-        return false;
-    }
-
-    return calibrate_all_simple();
+    completed = true;
+    return {};
 }
 
 /**
@@ -834,6 +846,21 @@ bool full_calibration() {
  *
  */
 void GcodeSuite::G425() {
-    full_calibration();
+    if (axis_unhomed_error()) {
+        return;
+    }
+    pin_calibration::PinCalibration calibration;
+    const auto result = calibration.measure_remaining_tools();
+    if (!result) {
+        switch (result.error().reason) {
+        case pin_calibration::NozzleFailureReason::not_round:
+            mapi::park(mapi::get_parking_position(mapi::ParkPosition::filament_change));
+            marlin_server::set_warning(WarningType::NozzleDoesNotHaveRoundSection);
+            break;
+        case pin_calibration::NozzleFailureReason::xy_probe_unstable:
+            fatal_error(ErrCode::ERR_MECHANICAL_XY_PROBE_UNSTABLE);
+            break;
+        }
+    }
 }
 /** @}*/

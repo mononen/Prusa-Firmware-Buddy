@@ -4,6 +4,7 @@
 #include "selftest_tool_offsets_config.hpp"
 
 #include <all_tools_quick_cooling_manager.hpp>
+#include <marlin_stubs/G425.hpp>
 
 namespace selftest {
 
@@ -30,6 +31,7 @@ private:
     IPartHandler &state_machine;
     SelftestToolOffsets_t &result;
     const ToolOffsetsConfig_t &config;
+    pin_calibration::PinCalibration pin_calibration;
     AllToolsQuickCoolingManager quick_cooling { SelftestToolOffsets_t::TOOL_CALIBRATION_TEMPERATURE };
 };
 
