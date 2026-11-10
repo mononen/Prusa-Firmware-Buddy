@@ -62,6 +62,7 @@ enum class Response : uint8_t {
     Docks8,
     Other,
     Empty,
+    RetryShallower,
 
     _count,
     _last = _count - 1,

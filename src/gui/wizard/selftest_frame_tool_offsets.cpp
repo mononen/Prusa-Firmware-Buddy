@@ -6,6 +6,22 @@
 #include "marlin_client.hpp"
 #include <array>
 #include <module/prusa/toolchanger.h>
+#include <marlin_stubs/G425.hpp>
+
+namespace {
+const char *nozzle_side_label(uint8_t nozzle_side_30deg) {
+    switch ((nozzle_side_30deg * 30 + 22) / 45 % 8) {
+    case 0: return N_("right");
+    case 1: return N_("back-right");
+    case 2: return N_("back");
+    case 3: return N_("back-left");
+    case 4: return N_("left");
+    case 5: return N_("front-left");
+    case 6: return N_("front");
+    default: return N_("front-right");
+    }
+}
+} // namespace
 
 static constexpr size_t col_texts = WizardDefaults::MarginLeft;
 static constexpr size_t txt_h = WizardDefaults::txt_h;
@@ -67,6 +83,22 @@ void SelftestFrameToolOffsets::change() {
         text_phase.SetText(_("Calibrating tool offsets."));
         text_detail.Hide();
         break;
+
+    case PhasesSelftest::ToolOffsets_wait_user_clean_failed_nozzle_cold:
+    case PhasesSelftest::ToolOffsets_wait_user_clean_failed_nozzle_hot: {
+        const SelftestToolOffsets_t data(data_current);
+        text_phase.SetText(data.failure_is_unstable
+                ? _("XY probing of the nozzle was unstable. The tool is in its dock.\n- Clean the nozzle\n- Put the tool back into its dock\n- Press Retry, or Shallower to probe nearer the tip")
+                : _("Nozzle is not round. The tool is in its dock.\n- Clean the nozzle\n- Put the tool back into its dock\n- Press Retry, or Shallower to probe nearer the tip"));
+        char side[16];
+        _(nozzle_side_label(data.nozzle_side_30deg)).copyToRAM(side, sizeof(side));
+        const double depth_mm = data.measured_shallow ? pin_calibration::SHALLOW_BORE_DEPTH_MM : pin_calibration::DEFAULT_BORE_DEPTH_MM;
+        text_detail.SetText(data.failure_is_unstable
+                ? _("Tool %d, %s side (%d°), depth %.1f mm").formatted(failed_nozzle_params, data.failed_tool_raw + 1, side, data.nozzle_side_30deg * 30, depth_mm)
+                : _("Tool %d, %s side (%d°), +%.2f mm, depth %.1f mm").formatted(failed_nozzle_params, data.failed_tool_raw + 1, side, data.nozzle_side_30deg * 30, static_cast<double>(data.deviation_centi_mm) / 100.0, depth_mm));
+        text_detail.Show();
+        break;
+    }
 
     case PhasesSelftest::ToolOffsets_wait_move_away:
         text_phase.SetText(_("Moving away."));

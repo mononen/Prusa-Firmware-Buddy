@@ -112,6 +112,8 @@ inline constexpr const char *get_response_text(Response response) {
         return N_("8 DOCKS");
     case Response::Other:
         return N_("OTHER");
+    case Response::RetryShallower:
+        return N_("SHALLOWER");
 
     case Response::_count:
         break;

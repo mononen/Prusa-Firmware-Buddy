@@ -5,12 +5,14 @@
 
 #include <all_tools_quick_cooling_manager.hpp>
 #include <marlin_stubs/G425.hpp>
+#include <optional>
 
 namespace selftest {
 
 class CSelftestPart_ToolOffsets {
 public:
     CSelftestPart_ToolOffsets(IPartHandler &state_machine, const ToolOffsetsConfig_t &config, SelftestToolOffsets_t &result);
+    ~CSelftestPart_ToolOffsets();
 
     LoopResult state_ask_user_confirm_start();
     LoopResult state_clean_nozzle_start();
@@ -21,17 +23,22 @@ public:
     LoopResult state_home_park();
     LoopResult state_wait_moves_done();
     LoopResult state_ask_user_install_pin();
+    LoopResult state_cycle_mark0() { return LoopResult::MarkLoop0; }
     LoopResult state_wait_stable_temp();
     LoopResult state_calibrate();
+    LoopResult state_clean_failed_nozzle();
     LoopResult state_finish_calibration();
     LoopResult state_final_park();
     LoopResult state_ask_user_remove_pin();
 
 private:
+    LoopResult retry_failed_nozzle();
+
     IPartHandler &state_machine;
     SelftestToolOffsets_t &result;
     const ToolOffsetsConfig_t &config;
     pin_calibration::PinCalibration pin_calibration;
+    std::optional<pin_calibration::NozzleFailure> failed_nozzle;
     AllToolsQuickCoolingManager quick_cooling { SelftestToolOffsets_t::TOOL_CALIBRATION_TEMPERATURE };
 };
 

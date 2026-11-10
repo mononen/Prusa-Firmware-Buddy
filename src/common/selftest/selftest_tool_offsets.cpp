@@ -6,6 +6,9 @@
 #include "selftest_tool_helper.hpp"
 #include "Marlin/src/module/temperature.h"
 #include "fanctl.hpp"
+#include <module/tool_change.h>
+#include <algorithm>
+#include <cmath>
 
 #include <tool_index.hpp>
 
@@ -39,6 +42,12 @@ CSelftestPart_ToolOffsets::CSelftestPart_ToolOffsets(IPartHandler &state_machine
     : state_machine(state_machine)
     , result(result)
     , config(config) {}
+
+CSelftestPart_ToolOffsets::~CSelftestPart_ToolOffsets() {
+    if (failed_nozzle) {
+        thermalManager.setTargetHotend(0, failed_nozzle->tool);
+    }
+}
 
 LoopResult CSelftestPart_ToolOffsets::state_ask_user_confirm_start() {
     IPartHandler::SetFsmPhase(PhasesSelftest::ToolOffsets_wait_user_confirm_start);
@@ -143,10 +152,61 @@ LoopResult CSelftestPart_ToolOffsets::state_calibrate() {
 
 // The FSM must publish the calibration phase before the blocking measurement.
 LoopResult CSelftestPart_ToolOffsets::state_finish_calibration() {
-    if (axis_unhomed_error() || !pin_calibration.measure_remaining_tools()) {
+    if (axis_unhomed_error()) {
         return LoopResult::Fail;
     }
+    const auto measured = pin_calibration.measure_remaining_tools();
+    if (measured) {
+        return LoopResult::RunNext;
+    }
+    failed_nozzle = measured.error();
+    result.failed_tool_raw = failed_nozzle->tool.to_raw();
+    result.nozzle_side_30deg = failed_nozzle->nozzle_side_30deg;
+    result.failure_is_unstable = failed_nozzle->reason == pin_calibration::NozzleFailureReason::xy_probe_unstable;
+    result.measured_shallow = failed_nozzle->bore_depth_mm == pin_calibration::SHALLOW_BORE_DEPTH_MM;
+    result.deviation_centi_mm = static_cast<uint8_t>(std::clamp<long>(std::lround(failed_nozzle->deviation_mm * 100), 0, 255));
+    tool_change(NoTool {}, tool_return_t::no_return);
+    mapi::park(mapi::get_parking_position(mapi::ParkPosition::filament_change));
+    IPartHandler::SetFsmPhase(PhasesSelftest::ToolOffsets_wait_user_clean_failed_nozzle_cold);
     return LoopResult::RunNext;
+}
+
+LoopResult CSelftestPart_ToolOffsets::retry_failed_nozzle() {
+    thermalManager.setTargetHotend(SelftestToolOffsets_t::TOOL_CALIBRATION_TEMPERATURE, failed_nozzle->tool);
+    quick_cooling.set_active(true);
+    failed_nozzle.reset();
+    result.failed_tool_raw = 0;
+    result.nozzle_side_30deg = 0;
+    result.failure_is_unstable = false;
+    result.measured_shallow = false;
+    result.deviation_centi_mm = 0;
+    return LoopResult::GoToMark0;
+}
+
+LoopResult CSelftestPart_ToolOffsets::state_clean_failed_nozzle() {
+    if (!failed_nozzle) {
+        return LoopResult::RunNext;
+    }
+    switch (state_machine.GetButtonPressed()) {
+    case Response::Retry:
+        return retry_failed_nozzle();
+    case Response::RetryShallower:
+        pin_calibration.use_shallow_bore_depth(failed_nozzle->tool);
+        return retry_failed_nozzle();
+    case Response::Heatup:
+        IPartHandler::SetFsmPhase(PhasesSelftest::ToolOffsets_wait_user_clean_failed_nozzle_hot);
+        thermalManager.setTargetHotend(SelftestToolOffsets_t::FAILED_NOZZLE_CLEANING_TEMPERATURE, failed_nozzle->tool);
+        quick_cooling.set_active(false);
+        break;
+    case Response::Cooldown:
+        IPartHandler::SetFsmPhase(PhasesSelftest::ToolOffsets_wait_user_clean_failed_nozzle_cold);
+        thermalManager.setTargetHotend(SelftestToolOffsets_t::TOOL_CALIBRATION_TEMPERATURE, failed_nozzle->tool);
+        quick_cooling.set_active(true);
+        break;
+    default:
+        break;
+    }
+    return LoopResult::RunCurrent;
 }
 
 LoopResult CSelftestPart_ToolOffsets::state_final_park() {
